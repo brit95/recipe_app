@@ -1,0 +1,6 @@
+PySide6>=6.5.0
+
+# Optional but strongly recommended — enables clean imports from 300+ recipe sites
+# (AllRecipes, Food Network, NYT Cooking, Serious Eats, Epicurious, etc.)
+# Falls back to JSON-LD / heuristic parsing if not installed.
+recipe-scrapers>=14.0.0
