@@ -1,9 +1,69 @@
 import sqlite3
 import os
+import sys
+import shutil
 from datetime import date, timedelta
 from typing import Optional
 
-DB_PATH = os.path.join(os.path.expanduser("~"), ".recipe_manager.db")
+# ── Database location ─────────────────────────────────────────────
+# When running from source, use a SQLite file inside the repo (preferring the
+# existing `.recipe_manager.db` which has the full recipe history).
+#
+# When running as a PyInstaller `--onefile` executable, `__file__` points
+# inside a temp extraction dir (sys._MEIPASS) that is wiped on exit, so we
+# instead place the writable DB next to the .exe and copy a bundled seed DB
+# on first launch.
+def _is_frozen() -> bool:
+    return getattr(sys, "frozen", False)
+
+
+def _resource_path(name: str) -> str:
+    """Resolve a read-only resource path inside the PyInstaller bundle."""
+    base = getattr(sys, "_MEIPASS", os.path.dirname(__file__))
+    return os.path.join(base, name)
+
+
+def _resolve_db_path() -> str:
+    if _is_frozen():
+        exe_dir = os.path.dirname(sys.executable)
+        # Try to keep the DB next to the executable (portable / USB-stick
+        # friendly). If that folder isn't writable (e.g. user installed the
+        # binary to /usr/local/bin or Program Files), fall back to a
+        # per-user data directory.
+        target_dir = exe_dir
+        if not os.access(exe_dir, os.W_OK):
+            if sys.platform.startswith("win"):
+                base = os.environ.get("APPDATA") or os.path.expanduser("~")
+            elif sys.platform == "darwin":
+                base = os.path.expanduser("~/Library/Application Support")
+            else:
+                base = os.environ.get(
+                    "XDG_DATA_HOME", os.path.expanduser("~/.local/share")
+                )
+            target_dir = os.path.join(base, "RecipeManager")
+            os.makedirs(target_dir, exist_ok=True)
+
+        target = os.path.join(target_dir, "recipe_manager.db")
+        if not os.path.exists(target):
+            # Seed from a DB packaged with the executable, if present.
+            for candidate in (".recipe_manager.db", "recipe_manager.db"):
+                seed = _resource_path(candidate)
+                if os.path.exists(seed):
+                    try:
+                        shutil.copyfile(seed, target)
+                    except OSError:
+                        pass
+                    break
+        return target
+
+    # Running from source: prefer the hidden DB in the repo.
+    repo_dir = os.path.dirname(__file__)
+    hidden = os.path.join(repo_dir, ".recipe_manager.db")
+    default = os.path.join(repo_dir, "recipe_manager.db")
+    return hidden if os.path.exists(hidden) else default
+
+
+DB_PATH = _resolve_db_path()
 
 
 def get_connection():
@@ -507,3 +567,144 @@ def load_json_recipes(path: str) -> list[dict]:
             "_source_file": path,
         })
     return result
+
+
+# ── Deduplication ─────────────────────────────────────────────────────────────
+
+def _normalize_name(name: str) -> str:
+    """Normalize a recipe name for duplicate detection."""
+    return " ".join((name or "").strip().lower().split())
+
+
+def find_duplicate_groups() -> list[dict]:
+    """
+    Group recipes that share a normalized name. Returns a list of groups, each:
+        {
+            "name": <display name of first variant>,
+            "key":  <normalized name>,
+            "recipes": [
+                {"id", "name", "url", "created_at",
+                 "ingredient_count", "tag_count", "body_len", "notes_len"},
+                ...
+            ]
+        }
+    Only groups with 2+ recipes are included. Groups are ordered alphabetically.
+    """
+    with get_connection() as conn:
+        rows = conn.execute("""
+            SELECT r.id, r.name, r.url, r.created_at,
+                   COALESCE(LENGTH(r.body),  0) AS body_len,
+                   COALESCE(LENGTH(r.notes), 0) AS notes_len,
+                   (SELECT COUNT(*) FROM ingredients i WHERE i.recipe_id = r.id) AS ingredient_count,
+                   (SELECT COUNT(*) FROM recipe_tags rt WHERE rt.recipe_id = r.id) AS tag_count
+            FROM recipes r
+            ORDER BY r.name COLLATE NOCASE, r.id
+        """).fetchall()
+
+    groups: dict[str, list[dict]] = {}
+    for row in rows:
+        key = _normalize_name(row["name"])
+        if not key:
+            continue
+        groups.setdefault(key, []).append(dict(row))
+
+    out = []
+    for key, recipes in groups.items():
+        if len(recipes) < 2:
+            continue
+        out.append({
+            "name": recipes[0]["name"],
+            "key":  key,
+            "recipes": recipes,
+        })
+    out.sort(key=lambda g: g["name"].lower())
+    return out
+
+
+def _pick_keeper(recipes: list[dict]) -> int:
+    """
+    Pick the 'best' recipe id to keep from a duplicate group.
+    Heuristic: most ingredients → most tags → longest body → longest notes
+    → has URL → smallest id (oldest).
+    """
+    def score(r):
+        return (
+            r.get("ingredient_count", 0),
+            r.get("tag_count", 0),
+            r.get("body_len", 0),
+            r.get("notes_len", 0),
+            1 if (r.get("url") or "").strip() else 0,
+            -int(r["id"]),  # prefer smaller id as final tiebreak
+        )
+    return max(recipes, key=score)["id"]
+
+
+def dedupe_recipes(dry_run: bool = False) -> dict:
+    """
+    Remove duplicate recipes (grouped by normalized name).
+
+    Strategy per group:
+      - Pick a 'keeper' (richest recipe; see _pick_keeper).
+      - Reassign meal_plan rows that reference duplicates to the keeper.
+      - Merge tags from duplicates onto the keeper.
+      - Delete the duplicate recipe rows (ingredients/tags cascade).
+
+    Returns a summary:
+        {
+            "groups": <int>,            # number of duplicate groups found
+            "duplicates_removed": <int>,
+            "kept": [<keeper_id>, ...],
+            "removed": [<deleted_id>, ...],
+            "dry_run": <bool>,
+        }
+    """
+    groups = find_duplicate_groups()
+    summary = {
+        "groups": len(groups),
+        "duplicates_removed": 0,
+        "kept": [],
+        "removed": [],
+        "dry_run": dry_run,
+    }
+    if not groups:
+        return summary
+
+    with get_connection() as conn:
+        for grp in groups:
+            keeper_id = _pick_keeper(grp["recipes"])
+            dup_ids = [r["id"] for r in grp["recipes"] if r["id"] != keeper_id]
+            summary["kept"].append(keeper_id)
+            summary["removed"].extend(dup_ids)
+            summary["duplicates_removed"] += len(dup_ids)
+
+            if dry_run or not dup_ids:
+                continue
+
+            placeholders = ",".join("?" * len(dup_ids))
+
+            # Reassign meal-plan references → keeper (ignore conflicts on UNIQUE)
+            conn.execute(
+                f"""UPDATE OR IGNORE meal_plan
+                       SET recipe_id = ?
+                     WHERE recipe_id IN ({placeholders})""",
+                (keeper_id, *dup_ids),
+            )
+            # Any meal-plan rows that couldn't be reassigned (UNIQUE conflict)
+            # still point at a soon-to-be-deleted recipe. Cascade will set them
+            # to NULL via the existing FK (ON DELETE SET NULL).
+
+            # Merge tags from duplicates onto the keeper
+            conn.execute(
+                f"""INSERT OR IGNORE INTO recipe_tags (recipe_id, tag_id)
+                       SELECT ?, tag_id FROM recipe_tags
+                        WHERE recipe_id IN ({placeholders})""",
+                (keeper_id, *dup_ids),
+            )
+
+            # Delete duplicates (ingredients + recipe_tags cascade)
+            conn.execute(
+                f"DELETE FROM recipes WHERE id IN ({placeholders})",
+                dup_ids,
+            )
+
+    return summary

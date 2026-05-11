@@ -294,12 +294,147 @@ class RecipeDetailPane(QWidget):
             self.delete_requested.emit(self._recipe_id)
 
 
+class DedupeDialog(QDialog):
+    """Find duplicate recipes (grouped by name) and let the user remove them."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Find Duplicate Recipes")
+        self.resize(720, 520)
+
+        layout = QVBoxLayout(self)
+
+        self.summary_label = QLabel()
+        self.summary_label.setWordWrap(True)
+        layout.addWidget(self.summary_label)
+
+        hint = QLabel(
+            "Recipes are grouped by name (case-insensitive). The 'keeper' is "
+            "chosen automatically based on richest content (most ingredients, "
+            "tags, then body length). Duplicates' tags and meal-plan entries "
+            "are merged into the keeper before deletion."
+        )
+        hint.setObjectName("hintLabel")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        self.table = QTableWidget(0, 5)
+        self.table.setHorizontalHeaderLabels(
+            ["Recipe", "ID", "Ingredients", "Tags", "Action"]
+        )
+        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeToContents)
+        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.table.setSelectionMode(QAbstractItemView.NoSelection)
+        self.table.verticalHeader().setVisible(False)
+        layout.addWidget(self.table, 1)
+
+        btn_row = QHBoxLayout()
+        self.refresh_btn = QPushButton("🔄  Re-scan")
+        self.refresh_btn.setObjectName("smallBtn")
+        self.refresh_btn.clicked.connect(self._populate)
+
+        self.delete_btn = QPushButton("🗑  Remove duplicates")
+        self.delete_btn.setObjectName("deleteBtn")
+        self.delete_btn.clicked.connect(self._run_dedupe)
+
+        close_btn = QPushButton("Close")
+        close_btn.setObjectName("smallBtn")
+        close_btn.clicked.connect(self.reject)
+
+        btn_row.addWidget(self.refresh_btn)
+        btn_row.addStretch(1)
+        btn_row.addWidget(self.delete_btn)
+        btn_row.addWidget(close_btn)
+        layout.addLayout(btn_row)
+
+        self._populate()
+
+    def _populate(self):
+        try:
+            preview = db.dedupe_recipes(dry_run=True)
+            groups = db.find_duplicate_groups()
+        except Exception as e:
+            QMessageBox.warning(self, "Dedupe failed", str(e))
+            return
+
+        self.summary_label.setText(
+            f"<b>{preview['groups']}</b> duplicate group(s) found · "
+            f"<b>{preview['duplicates_removed']}</b> recipe(s) would be removed."
+        )
+        self.delete_btn.setEnabled(preview["duplicates_removed"] > 0)
+
+        keep_ids = set(preview["kept"])
+        self.table.setRowCount(0)
+        for grp in groups:
+            row = self.table.rowCount()
+            self.table.insertRow(row)
+            header = QTableWidgetItem(f"▸ {grp['name']}  ({len(grp['recipes'])})")
+            font = header.font()
+            font.setBold(True)
+            header.setFont(font)
+            header.setBackground(QColor("#f0ede8"))
+            self.table.setItem(row, 0, header)
+            for c in range(1, 5):
+                cell = QTableWidgetItem("")
+                cell.setBackground(QColor("#f0ede8"))
+                self.table.setItem(row, c, cell)
+            self.table.setSpan(row, 0, 1, 5)
+
+            for r in grp["recipes"]:
+                row = self.table.rowCount()
+                self.table.insertRow(row)
+                self.table.setItem(row, 0, QTableWidgetItem("   " + r["name"]))
+                self.table.setItem(row, 1, QTableWidgetItem(str(r["id"])))
+                self.table.setItem(row, 2, QTableWidgetItem(str(r["ingredient_count"])))
+                self.table.setItem(row, 3, QTableWidgetItem(str(r["tag_count"])))
+                action = "KEEP" if r["id"] in keep_ids else "remove"
+                action_item = QTableWidgetItem(action)
+                if action == "KEEP":
+                    action_item.setForeground(QColor("#1a6b3a"))
+                    f = action_item.font(); f.setBold(True); action_item.setFont(f)
+                else:
+                    action_item.setForeground(QColor("#c0392b"))
+                self.table.setItem(row, 4, action_item)
+
+    def _run_dedupe(self):
+        preview = db.dedupe_recipes(dry_run=True)
+        n = preview["duplicates_removed"]
+        if n == 0:
+            QMessageBox.information(self, "Dedupe", "No duplicates to remove.")
+            return
+        reply = QMessageBox.question(
+            self, "Remove duplicates",
+            f"Remove {n} duplicate recipe(s)?\n\n"
+            "Their tags and meal-plan entries will be merged into the kept "
+            "recipe. This cannot be undone.",
+            QMessageBox.Yes | QMessageBox.No
+        )
+        if reply != QMessageBox.Yes:
+            return
+        try:
+            result = db.dedupe_recipes(dry_run=False)
+        except Exception as e:
+            QMessageBox.warning(self, "Dedupe failed", str(e))
+            return
+        QMessageBox.information(
+            self, "Dedupe complete",
+            f"Removed {result['duplicates_removed']} duplicate recipe(s) "
+            f"across {result['groups']} group(s)."
+        )
+        self.accept()
 class BrowseTab(QWidget):
     edit_recipe = Signal(int)
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._build_ui()
+        # Populate recipe list and tag filter immediately on construction
+        # so the Browse tab shows data without needing a tab switch.
+        self.refresh()
 
     def _build_ui(self):
         root = QVBoxLayout(self)
@@ -331,10 +466,16 @@ class BrowseTab(QWidget):
         export_json_btn.setObjectName("smallBtn")
         export_json_btn.clicked.connect(self._export_json)
 
+        dedupe_btn = QPushButton("🧹  Dedupe")
+        dedupe_btn.setObjectName("smallBtn")
+        dedupe_btn.setToolTip("Find and remove duplicate recipes (grouped by name)")
+        dedupe_btn.clicked.connect(self._open_dedupe)
+
         search_row.addWidget(self.search_box)
         search_row.addWidget(clear_btn)
         search_row.addWidget(tag_mgr_btn)
         search_row.addWidget(export_json_btn)
+        search_row.addWidget(dedupe_btn)
         top_layout.addLayout(search_row)
 
         # Tag legend
@@ -452,6 +593,11 @@ class BrowseTab(QWidget):
                                     f"Exported {count} recipes to:\n{path}")
         except Exception as e:
             QMessageBox.warning(self, "Export Failed", str(e))
+
+    def _open_dedupe(self):
+        dlg = DedupeDialog(self)
+        if dlg.exec() == QDialog.Accepted:
+            self.refresh()
 
 
 

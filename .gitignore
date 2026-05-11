@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Virtualenv
+.venv/
+venv/
+
+# PyInstaller build outputs
+build/
+dist/
+*.spec.bak
+
+# Local-only DB created by the packaged app on first launch
+/recipe_manager.db
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Export / scratch files
+recipes.json

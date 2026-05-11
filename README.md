@@ -25,8 +25,55 @@ pip install -r requirements.txt
 python main.py
 ```
 
-The database is stored at `~/.recipe_manager.db` (your home folder),
-so it persists between runs and won't be lost if you move the app folder.
+The database is stored alongside the app:
+- **From source** — `recipe_app/.recipe_manager.db` (preferred, with full history)
+  or `recipe_app/recipe_manager.db` if no hidden file is present.
+- **From the packaged `.exe`** — `recipe_manager.db` next to `RecipeManager.exe`.
+  The exe ships with a seed database that is copied there on first launch.
+
+---
+
+## Building a single-file executable
+
+For non-technical users you can ship a single self-contained binary with no
+Python install required.
+
+> ⚠️ **PyInstaller does not cross-compile.** Run the build on each target OS
+> (natively, in a VM, or via CI). The included GitHub Actions workflow
+> ([.github/workflows/build.yml](.github/workflows/build.yml)) builds a
+> Windows `.exe`, a Linux ELF binary, **and** macOS binaries for both Intel
+> and Apple Silicon automatically on every push, attaching them to a GitHub
+> Release on tagged commits (`v*`).
+
+### Windows
+```powershell
+cd recipe_app
+.\build.ps1
+# → dist\RecipeManager.exe  (~55 MB)
+```
+
+### Linux / macOS
+```bash
+cd recipe_app
+./build.sh
+# → dist/RecipeManager       (ELF on Linux, Mach-O on macOS)
+chmod +x dist/RecipeManager   # if needed
+./dist/RecipeManager
+```
+
+The build produces a single self-contained binary (no extra files needed).
+At runtime the app writes its database (`recipe_manager.db`) next to the
+binary if that folder is writable; otherwise it falls back to a per-user
+data directory:
+
+| OS      | Fallback location                            |
+|---------|----------------------------------------------|
+| Windows | `%APPDATA%\RecipeManager\recipe_manager.db`  |
+| Linux   | `~/.local/share/RecipeManager/recipe_manager.db` |
+| macOS   | `~/Library/Application Support/RecipeManager/recipe_manager.db` |
+
+On first launch the database is seeded from a copy bundled into the binary
+at build time.
 
 ---
 
@@ -110,5 +157,6 @@ recipe_app/
 
 - **Tags** are auto-created as you type them — no setup needed
 - The first launch seeds 5 demo recipes so the app isn't empty
-- The database lives at `~/.recipe_manager.db` — back it up anytime
+- The database lives next to the app (`.recipe_manager.db` in the repo, or
+  `recipe_manager.db` next to `RecipeManager.exe`) — back it up anytime
 - Recipes with a URL but no body text will show "use URL above" in the instructions pane

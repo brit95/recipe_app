@@ -1,15 +1,59 @@
 import sys
+import os
+import traceback
+import logging
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QTabWidget, QWidget,
-    QStatusBar, QLabel
+    QStatusBar, QLabel, QMessageBox
 )
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, qInstallMessageHandler, QtMsgType
 from PySide6.QtGui import QFont, QIcon
 
 import database as db
 from browse_tab import BrowseTab
 from add_recipe_tab import AddEditTab
 from planner_tab import MealPlannerTab
+
+
+# ── Debugging helpers ─────────────────────────────────────────────
+# Qt6/PySide6 will abort the process on unhandled Python exceptions raised
+# inside signal slots. Install a global excepthook so we instead log the full
+# traceback and show a dialog, which makes button-click crashes debuggable.
+logging.basicConfig(
+    level=logging.DEBUG,
+    format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
+)
+log = logging.getLogger("recipe_app")
+
+
+def _excepthook(exc_type, exc_value, exc_tb):
+    text = "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
+    log.error("Unhandled exception:\n%s", text)
+    try:
+        QMessageBox.critical(
+            None,
+            "Unhandled error",
+            f"{exc_type.__name__}: {exc_value}\n\n{text}",
+        )
+    except Exception:
+        pass
+
+
+sys.excepthook = _excepthook
+
+
+def _qt_message_handler(mode, context, message):
+    levels = {
+        QtMsgType.QtDebugMsg: logging.DEBUG,
+        QtMsgType.QtInfoMsg: logging.INFO,
+        QtMsgType.QtWarningMsg: logging.WARNING,
+        QtMsgType.QtCriticalMsg: logging.ERROR,
+        QtMsgType.QtFatalMsg: logging.CRITICAL,
+    }
+    log.log(levels.get(mode, logging.INFO), "Qt: %s", message)
+
+
+qInstallMessageHandler(_qt_message_handler)
 
 
 STYLESHEET = """
@@ -256,6 +300,8 @@ QPushButton {
 }
 #importTexBtn:hover { background: #4a3070; }
 
+#importBtn {
+    background: #1a6b3a;
     color: #fff;
     border: none;
     font-weight: 600;
@@ -474,10 +520,28 @@ class MainWindow(QMainWindow):
         self.setStatusBar(self.status)
         self.status.showMessage("Ready")
 
+        # Show DB info permanently on the right side of the status bar
+        self.db_status_label = QLabel()
+        self.db_status_label.setObjectName("hintLabel")
+        self.status.addPermanentWidget(self.db_status_label)
+        self._update_db_status()
+
+    def _update_db_status(self):
+        try:
+            count = len(db.all_recipes_brief())
+        except Exception as e:
+            log.exception("Failed to count recipes")
+            self.db_status_label.setText("⚠ DB error")
+            return
+        path = db.DB_PATH
+        self.db_status_label.setText(f"📂 {os.path.basename(path)}  ·  {count} recipes")
+        self.db_status_label.setToolTip(path)
+
     def _on_recipe_saved(self):
         self.browse_tab.refresh()
         self.tabs.setCurrentWidget(self.browse_tab)
         self.status.showMessage("Recipe saved!", 3000)
+        self._update_db_status()
 
     def _edit_recipe(self, recipe_id: int):
         self.add_tab.load_recipe_for_edit(recipe_id)
@@ -491,15 +555,50 @@ class MainWindow(QMainWindow):
             self.planner_tab.refresh()
 
 
-def main():
-    db.init_db()
-    db.seed_demo_data()
+def _load_database():
+    """
+    Ensure the SQLite database is present and reachable on launch.
+    Creates the schema if missing, seeds demo data when empty,
+    and logs a one-line summary of the path + recipe count.
+    Raises on hard failure so the caller can show a dialog.
+    """
+    log.info("Loading database from: %s", db.DB_PATH)
+    db.init_db()           # idempotent: creates tables if missing
+    db.seed_demo_data()    # only seeds when the table is empty
 
+    with db.get_connection() as conn:
+        count = conn.execute("SELECT COUNT(*) FROM recipes").fetchone()[0]
+        tag_count = conn.execute("SELECT COUNT(*) FROM tags").fetchone()[0]
+    exists = os.path.exists(db.DB_PATH)
+    size_kb = os.path.getsize(db.DB_PATH) / 1024 if exists else 0
+    log.info(
+        "Database ready: %s (%.1f KB) — %d recipes, %d tags",
+        db.DB_PATH, size_kb, count, tag_count,
+    )
+    return {"path": db.DB_PATH, "recipes": count, "tags": tag_count}
+
+
+def main():
     app = QApplication(sys.argv)
     app.setApplicationName("Recipe Manager")
     app.setStyleSheet(STYLESHEET)
 
+    try:
+        info = _load_database()
+    except Exception as e:
+        log.exception("Failed to load database")
+        QMessageBox.critical(
+            None,
+            "Database error",
+            f"Could not load the recipe database:\n\n{db.DB_PATH}\n\n{e}",
+        )
+        sys.exit(1)
+
     window = MainWindow()
+    window.status.showMessage(
+        f"Loaded {info['recipes']} recipes from {os.path.basename(info['path'])}",
+        5000,
+    )
     window.show()
     sys.exit(app.exec())
 

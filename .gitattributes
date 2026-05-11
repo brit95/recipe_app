@@ -1,0 +1,16 @@
+# Always use LF for shell scripts (so they run on Linux/macOS after checkout
+# on Windows).
+*.sh        text eol=lf
+build.sh    text eol=lf
+
+# PowerShell stays CRLF on Windows.
+*.ps1       text eol=crlf
+
+# Python source uses LF.
+*.py        text eol=lf
+
+# Treat binary blobs as binary.
+*.db        binary
+*.png       binary
+*.jpg       binary
+*.ico       binary
