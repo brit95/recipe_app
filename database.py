@@ -145,25 +145,67 @@ def get_recipe(recipe_id: int) -> Optional[dict]:
         return recipe
 
 
-def search_recipes(query: str = "", tags: list[str] = None) -> list[dict]:
+def search_recipes(query: str = "", tags: list[str] = None,
+                   and_tags: list[str] = None,
+                   not_tags: list[str] = None) -> list[dict]:
+    """
+    Search recipes with boolean tag logic.
+    tags      = OR  (match any)
+    and_tags  = AND (must match all)
+    not_tags  = NOT (must not have any)
+    """
     with get_connection() as conn:
-        sql = """
+        # Start with all recipes, filter down
+        base = """
             SELECT DISTINCT r.id, r.name, r.url, r.created_at
             FROM recipes r
         """
+        conditions = []
         params = []
+
+        # OR tags — recipe must have at least one
         if tags:
             placeholders = ",".join("?" * len(tags))
-            sql += f"""
-                JOIN recipe_tags rt ON rt.recipe_id = r.id
-                JOIN tags t ON t.id = rt.tag_id AND t.name IN ({placeholders})
+            base += f"""
+                JOIN recipe_tags rt_or ON rt_or.recipe_id = r.id
+                JOIN tags t_or ON t_or.id = rt_or.tag_id AND t_or.name IN ({placeholders})
             """
             params.extend(tags)
+
+        # Name search
         if query:
-            sql += " WHERE r.name LIKE ?"
+            conditions.append("r.name LIKE ?")
             params.append(f"%{query}%")
-        sql += " ORDER BY r.name"
-        rows = conn.execute(sql, params).fetchall()
+
+        # AND tags — recipe must have every one
+        if and_tags:
+            for tag in and_tags:
+                conditions.append("""
+                    EXISTS (
+                        SELECT 1 FROM recipe_tags rt_a
+                        JOIN tags t_a ON t_a.id = rt_a.tag_id
+                        WHERE rt_a.recipe_id = r.id AND t_a.name = ?
+                    )
+                """)
+                params.append(tag)
+
+        # NOT tags — recipe must have none of these
+        if not_tags:
+            placeholders = ",".join("?" * len(not_tags))
+            conditions.append(f"""
+                NOT EXISTS (
+                    SELECT 1 FROM recipe_tags rt_n
+                    JOIN tags t_n ON t_n.id = rt_n.tag_id
+                    WHERE rt_n.recipe_id = r.id AND t_n.name IN ({placeholders})
+                )
+            """)
+            params.extend(not_tags)
+
+        if conditions:
+            base += " WHERE " + " AND ".join(conditions)
+        base += " ORDER BY r.name"
+
+        rows = conn.execute(base, params).fetchall()
         results = []
         for row in rows:
             r = dict(row)
@@ -346,3 +388,122 @@ def seed_demo_data():
     for r in recipes:
         add_recipe(r["name"], r["url"], r["body"], r["notes"],
                    r["ingredients"], r["tags"])
+
+
+# ── Tag management ────────────────────────────────────────────────────────────
+
+def delete_tag(tag_name: str):
+    """Delete a tag and remove it from all recipes."""
+    with get_connection() as conn:
+        conn.execute("DELETE FROM tags WHERE name=?", (tag_name,))
+
+
+def rename_tag(old_name: str, new_name: str):
+    """
+    Rename a tag. If new_name already exists, merge (reassign all recipes
+    from old tag to the existing new tag, then delete old).
+    """
+    new_name = new_name.strip().lower()
+    with get_connection() as conn:
+        existing = conn.execute(
+            "SELECT id FROM tags WHERE name=?", (new_name,)
+        ).fetchone()
+        old_row = conn.execute(
+            "SELECT id FROM tags WHERE name=?", (old_name,)
+        ).fetchone()
+        if not old_row:
+            return
+        old_id = old_row["id"]
+
+        if existing:
+            new_id = existing["id"]
+            # Move any recipe_tags from old to new (skip duplicates)
+            conn.execute("""
+                UPDATE OR IGNORE recipe_tags SET tag_id=? WHERE tag_id=?
+            """, (new_id, old_id))
+            conn.execute("DELETE FROM recipe_tags WHERE tag_id=?", (old_id,))
+            conn.execute("DELETE FROM tags WHERE id=?", (old_id,))
+        else:
+            conn.execute(
+                "UPDATE tags SET name=? WHERE id=?", (new_name, old_id)
+            )
+
+
+def tag_usage_counts() -> list[dict]:
+    """Return all tags with how many recipes use each."""
+    with get_connection() as conn:
+        rows = conn.execute("""
+            SELECT t.name, COUNT(rt.recipe_id) as count
+            FROM tags t
+            LEFT JOIN recipe_tags rt ON rt.tag_id = t.id
+            GROUP BY t.id
+            ORDER BY t.name
+        """).fetchall()
+        return [dict(r) for r in rows]
+
+
+# ── JSON export / import ──────────────────────────────────────────────────────
+
+import json as _json
+
+def export_to_json(path: str):
+    """Export all recipes to a JSON file."""
+    recipes = []
+    for brief in all_recipes_brief():
+        r = get_recipe(brief["id"])
+        recipes.append({
+            "name":        r["name"],
+            "url":         r.get("url", ""),
+            "body":        r.get("body", ""),
+            "notes":       r.get("notes", ""),
+            "tags":        r.get("tags", []),
+            "ingredients": r.get("ingredients", []),
+            "created_at":  r.get("created_at", ""),
+        })
+    with open(path, "w", encoding="utf-8") as f:
+        _json.dump({"version": 1, "recipes": recipes}, f, indent=2, ensure_ascii=False)
+
+
+def load_json_recipes(path: str) -> list[dict]:
+    """
+    Load recipes from a JSON export file.
+    Returns a list of recipe dicts ready for the import preview dialog.
+    Raises ValueError for unrecognised file formats.
+    """
+    with open(path, encoding="utf-8") as f:
+        data = _json.load(f)
+
+    # Support both {version, recipes:[...]} and bare [...]
+    if isinstance(data, list):
+        recipes = data
+    elif isinstance(data, dict) and "recipes" in data:
+        recipes = data["recipes"]
+    else:
+        raise ValueError("Unrecognised JSON format — expected a list of recipes "
+                         "or {\"version\": 1, \"recipes\": [...]}")
+
+    result = []
+    for r in recipes:
+        if not isinstance(r, dict) or not r.get("name"):
+            continue
+        # Normalise ingredient dicts
+        ings = []
+        for ing in r.get("ingredients", []):
+            if isinstance(ing, str):
+                ings.append({"item": ing, "quantity": "", "unit": ""})
+            elif isinstance(ing, dict):
+                ings.append({
+                    "item":     ing.get("item", ""),
+                    "quantity": ing.get("quantity", ""),
+                    "unit":     ing.get("unit", ""),
+                })
+        result.append({
+            "name":        r.get("name", "").strip(),
+            "url":         r.get("url", ""),
+            "body":        r.get("body", ""),
+            "notes":       r.get("notes", ""),
+            "tags":        r.get("tags", []),
+            "ingredients": ings,
+            "_source_file": path,
+        })
+    return result

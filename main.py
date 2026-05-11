@@ -95,6 +95,37 @@ QPushButton#tagBtn:checked {
 QPushButton#tagBtn:hover:!checked {
     background: #d5d2cc;
 }
+QPushButton#tagBtnOR {
+    background: #2471a3;
+    color: #fff;
+    border: 1.5px solid #1a5276;
+    border-radius: 14px;
+    padding: 4px 12px;
+    font-size: 12px;
+    font-weight: 600;
+}
+QPushButton#tagBtnOR:hover { background: #1a5276; }
+QPushButton#tagBtnAND {
+    background: #1e8449;
+    color: #fff;
+    border: 1.5px solid #196f3d;
+    border-radius: 14px;
+    padding: 4px 12px;
+    font-size: 12px;
+    font-weight: 600;
+}
+QPushButton#tagBtnAND:hover { background: #196f3d; }
+QPushButton#tagBtnNOT {
+    background: #c0392b;
+    color: #fff;
+    border: 1.5px solid #a93226;
+    border-radius: 14px;
+    padding: 4px 12px;
+    font-size: 12px;
+    font-weight: 600;
+    text-decoration: line-through;
+}
+QPushButton#tagBtnNOT:hover { background: #a93226; }
 
 /* ── Recipe list ────────────────────────────────────────────────── */
 QListWidget#recipeList {

@@ -123,9 +123,14 @@ class AddEditTab(QWidget):
         self.import_folder_btn.setObjectName("importTexBtn")
         self.import_folder_btn.setToolTip("Batch import all .tex files in a folder")
         self.import_folder_btn.clicked.connect(self._import_tex_folder)
+        self.import_json_btn = QPushButton("⬇  Import JSON…")
+        self.import_json_btn.setObjectName("importBtn")
+        self.import_json_btn.setToolTip("Import recipes from a shared JSON export file")
+        self.import_json_btn.clicked.connect(self._import_json)
         import_row.addWidget(self.import_btn)
         import_row.addWidget(self.import_tex_btn)
         import_row.addWidget(self.import_folder_btn)
+        import_row.addWidget(self.import_json_btn)
         import_row.addStretch()
         layout.addLayout(import_row)
 
@@ -348,6 +353,26 @@ class AddEditTab(QWidget):
                                         "No .tex files with recipe content found in that folder.")
                 return
             dlg = LatexImportDialog(recipes, source_label=folder, parent=self)
+            dlg.recipes_imported.connect(self._on_tex_imported)
+            dlg.exec()
+        except Exception as e:
+            QMessageBox.warning(self, "Import Error", str(e))
+
+    def _import_json(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Open JSON Recipe File", "",
+            "JSON Files (*.json);;All Files (*)"
+        )
+        if not path:
+            return
+        try:
+            from latex_import_dialog import LatexImportDialog
+            recipes = db.load_json_recipes(path)
+            if not recipes:
+                QMessageBox.information(self, "No Recipes Found",
+                                        "No recipes could be loaded from that file.")
+                return
+            dlg = LatexImportDialog(recipes, source_label=path, parent=self)
             dlg.recipes_imported.connect(self._on_tex_imported)
             dlg.exec()
         except Exception as e:
